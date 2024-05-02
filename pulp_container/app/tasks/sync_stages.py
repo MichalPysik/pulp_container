@@ -77,17 +77,24 @@ class ContainerFirstStage(Stage):
 
         digest = response.headers.get("docker-content-digest")
 
-        if digest and (manifest := await Manifest.objects.filter(digest=digest).afirst()):
-            raw_text_data = manifest.data
+        if (
+            manifest := await Manifest.objects.prefetch_related("contentartifact_set")
+            .filter(digest=digest)
+            .afirst()
+        ):
+            if raw_text_data := manifest.data:
+                content_data = json.loads(raw_text_data)
 
             # TODO: BACKWARD COMPATIBILITY - remove after fully migrating to artifactless manifest
-            if not raw_text_data:
-                saved_artifact = await manifest._artifacts.aget()
+            elif saved_artifact := await manifest._artifacts.aget():
                 content_data, raw_bytes_data = await sync_to_async(get_content_data)(saved_artifact)
                 raw_text_data = raw_bytes_data.decode("utf-8")
-            # END OF BACKWARD COMPATIBILITY
+            # if artifact is not available (due to reclaim space) we will download it again
             else:
-                content_data = json.loads(raw_text_data)
+                content_data, raw_text_data, response = await self._download_manifest_data(
+                    response.url
+                )
+            # END OF BACKWARD COMPATIBILITY
 
         else:
             content_data, raw_text_data, response = await self._download_manifest_data(response.url)
@@ -431,6 +438,24 @@ class ContainerFirstStage(Stage):
         )
         return sig_dc
 
+    async def _download_and_instantiate_manifest(self, manifest_url, digest):
+        content_data, raw_text_data, response = await self._download_manifest_data(manifest_url)
+        media_type = determine_media_type(content_data, response)
+        validate_manifest(content_data, media_type, digest)
+
+        manifest = Manifest(
+            digest=digest,
+            schema_version=(
+                2
+                if content_data["mediaType"] in (MEDIA_TYPE.MANIFEST_V2, MEDIA_TYPE.MANIFEST_OCI)
+                else 1
+            ),
+            media_type=content_data["mediaType"],
+            data=raw_text_data,
+            annotations=content_data.get("annotations", {}),
+        )
+        return content_data, manifest
+
     async def create_listed_manifest(self, manifest_data):
         """
         Create an Image Manifest from manifest data in a ManifestList.
@@ -445,32 +470,25 @@ class ContainerFirstStage(Stage):
         )
         manifest_url = urljoin(self.remote.url, relative_url)
 
-        if manifest := await Manifest.objects.filter(digest=digest).afirst():
-            # TODO: BACKWARD COMPATIBILITY - remove after fully migrating to artifactless manifest
-            if not manifest.data:
-                saved_artifact = await manifest._artifacts.aget()
-                content_data, _ = await sync_to_async(get_content_data)(saved_artifact)
-            # END OF BACKWARD COMPATIBILITY
-            else:
+        if (
+            manifest := await Manifest.objects.prefetch_related("contentartifact_set")
+            .filter(digest=digest)
+            .afirst()
+        ):
+            if manifest.data:
                 content_data = json.loads(manifest.data)
+            # TODO: BACKWARD COMPATIBILITY - remove after fully migrating to artifactless manifest
+            elif saved_artifact := await manifest._artifacts.aget():
+                content_data, _ = await sync_to_async(get_content_data)(saved_artifact)
+            # if artifact is not available (due to reclaim space) we will download it again
+            else:
+                content_data, manifest = await self._download_and_instantiate_manifest(
+                    manifest_url, digest
+                )
+            # END OF BACKWARD COMPATIBILITY
 
         else:
-            content_data, raw_text_data, response = await self._download_manifest_data(manifest_url)
-            media_type = determine_media_type(content_data, response)
-            validate_manifest(content_data, media_type, digest)
-
-            manifest = Manifest(
-                digest=digest,
-                schema_version=(
-                    2
-                    if content_data["mediaType"]
-                    in (MEDIA_TYPE.MANIFEST_V2, MEDIA_TYPE.MANIFEST_OCI)
-                    else 1
-                ),
-                media_type=content_data["mediaType"],
-                data=raw_text_data,
-                annotations=content_data.get("annotations", {}),
-            )
+            content_data, manifest = await self._download_and_instantiate_manifest(manifest_url, digest)
 
         platform = {}
         p = manifest_data["platform"]
